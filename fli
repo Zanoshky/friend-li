@@ -1,0 +1,1118 @@
+#!/usr/bin/env bash
+#
+# fli - CLI pet tamagotchi
+#
+# A shell companion that lives in your terminal. Deterministic species
+# rolled from your username, persistent mood and hunger, ASCII sprites
+# with idle animations, and a personality that grows over time.
+#
+# Usage:
+#   fli              Show your pet's status
+#   fli hatch        Hatch your companion (first time)
+#   fli hatch --seed=X  Hatch with a custom seed
+#   fli preview <s>  Preview a seed roll without hatching
+#   fli status       Show detailed stats and mood
+#   fli feed         Feed your pet
+#   fli pet          Pet your companion (hearts!)
+#   fli play         Play with your pet
+#   fli train <stat> Train a specific stat (DEBUGGING, PATIENCE, etc.)
+#   fli rename <n>   Rename your companion
+#   fli sprite       Show the full animated sprite
+#   fli animate      Watch idle animation loop (Ctrl+C to stop)
+#   fli advice       Get dev advice from your pet (stat-weighted)
+#   fli card         Show the companion card (rarity, stats, species)
+#   fli reroll       Reroll your companion (warning: resets everything)
+#   fli version      Show version
+#   fli help         Show this help
+#
+set -euo pipefail
+
+FRIEND_HOME="${HOME}/.friend-li"
+FRIEND_STATE="${FRIEND_HOME}/state.json"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Source sprites
+# shellcheck source=sprites.sh
+source "${SCRIPT_DIR}/sprites.sh"
+
+# Source advice pools
+# shellcheck source=advice.sh
+source "${SCRIPT_DIR}/advice.sh"
+
+# --- Colors ---
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+info()  { echo -e "${CYAN}[fli]${NC} $*"; }
+ok()    { echo -e "${GREEN}[fli]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[fli]${NC} $*"; }
+err()   { echo -e "${RED}[fli]${NC} $*" >&2; }
+
+# --- Seeded PRNG (mulberry32-style in bash) ---
+# Bash doesn't have 32-bit unsigned math natively, so we use a simpler LCG.
+
+PRNG_STATE=0
+
+seed_prng() {
+  local str="$1"
+  local hash=2166136261
+  local i
+  for (( i=0; i<${#str}; i++ )); do
+    local char_code
+    char_code=$(printf '%d' "'${str:$i:1}")
+    hash=$(( (hash ^ char_code) * 16777619 ))
+    hash=$(( hash & 0xFFFFFFFF ))
+  done
+  PRNG_STATE=${hash}
+}
+
+PRNG_RESULT=0
+
+prng_next() {
+  PRNG_STATE=$(( (PRNG_STATE + 0x6D2B79F5) & 0xFFFFFFFF ))
+  local t=$(( PRNG_STATE ))
+  t=$(( t ^ (t >> 15) ))
+  t=$(( (t * (1 | t)) & 0xFFFFFFFF ))
+  t=$(( (t + ((t ^ (t >> 7)) * (61 | t))) & 0xFFFFFFFF ))
+  t=$(( (t ^ (t >> 14)) & 0x7FFFFFFF ))
+  PRNG_RESULT=${t}
+}
+
+# Return a number in [0, max)
+prng_range() {
+  local max="$1"
+  prng_next
+  PRNG_RESULT=$(( PRNG_RESULT % max ))
+}
+
+# Pick from array - sets PRNG_PICK_RESULT
+PRNG_PICK_RESULT=""
+prng_pick() {
+  local -n arr=$1
+  prng_range ${#arr[@]}
+  PRNG_PICK_RESULT="${arr[$PRNG_RESULT]}"
+}
+
+# --- Roll rarity ---
+
+RARITY_RESULT=""
+roll_rarity() {
+  local total=100
+  prng_range ${total}
+  local roll=${PRNG_RESULT}
+  local cumulative=0
+  for i in "${!RARITIES[@]}"; do
+    cumulative=$(( cumulative + RARITY_WEIGHTS[i] ))
+    if [[ ${roll} -lt ${cumulative} ]]; then
+      RARITY_RESULT="${RARITIES[$i]}"
+      return
+    fi
+  done
+  RARITY_RESULT="common"
+}
+
+# --- Roll stats ---
+
+roll_stats() {
+  local rarity="$1"
+  local floor=${RARITY_FLOOR[$rarity]}
+  local peak_idx dump_idx
+  prng_range ${#STAT_NAMES[@]}
+  peak_idx=${PRNG_RESULT}
+  prng_range ${#STAT_NAMES[@]}
+  dump_idx=${PRNG_RESULT}
+  while [[ ${dump_idx} -eq ${peak_idx} ]]; do
+    prng_range ${#STAT_NAMES[@]}
+    dump_idx=${PRNG_RESULT}
+  done
+
+  for i in "${!STAT_NAMES[@]}"; do
+    local val
+    if [[ $i -eq ${peak_idx} ]]; then
+      prng_range 30
+      val=$(( floor + 50 + PRNG_RESULT ))
+      [[ ${val} -gt 100 ]] && val=100
+    elif [[ $i -eq ${dump_idx} ]]; then
+      prng_range 15
+      val=$(( floor - 10 + PRNG_RESULT ))
+      [[ ${val} -lt 1 ]] && val=1
+    else
+      prng_range 40
+      val=$(( floor + PRNG_RESULT ))
+    fi
+    echo "${STAT_NAMES[$i]}=${val}"
+  done
+}
+
+# --- State management (simple key=value file, no jq dependency) ---
+
+ensure_home() {
+  mkdir -p "${FRIEND_HOME}"
+}
+
+state_exists() {
+  [[ -f "${FRIEND_STATE}" ]]
+}
+
+read_state() {
+  local key="$1"
+  if [[ -f "${FRIEND_STATE}" ]]; then
+    grep "^${key}=" "${FRIEND_STATE}" 2>/dev/null | head -1 | cut -d'=' -f2-
+  fi
+}
+
+write_state() {
+  local key="$1"
+  local value="$2"
+  ensure_home
+  if [[ -f "${FRIEND_STATE}" ]] && grep -q "^${key}=" "${FRIEND_STATE}" 2>/dev/null; then
+    local tmp="${FRIEND_STATE}.tmp"
+    sed "s|^${key}=.*|${key}=${value}|" "${FRIEND_STATE}" > "${tmp}"
+    mv "${tmp}" "${FRIEND_STATE}"
+  else
+    echo "${key}=${value}" >> "${FRIEND_STATE}"
+  fi
+}
+
+# --- Time helpers ---
+
+now_epoch() {
+  date +%s
+}
+
+minutes_since() {
+  local then="$1"
+  local now
+  now=$(now_epoch)
+  echo $(( (now - then) / 60 ))
+}
+
+# --- Mood / hunger decay ---
+
+compute_mood() {
+  local last_pet last_play last_feed now mood hunger
+  last_pet=$(read_state "last_pet" || echo "0")
+  last_play=$(read_state "last_play" || echo "0")
+  last_feed=$(read_state "last_feed" || echo "0")
+  [[ -z "${last_pet}" ]] && last_pet=0
+  [[ -z "${last_play}" ]] && last_play=0
+  [[ -z "${last_feed}" ]] && last_feed=0
+  now=$(now_epoch)
+
+  # Mood decays 1 point per 30 minutes since last interaction
+  local last_interaction=${last_pet}
+  [[ ${last_play} -gt ${last_interaction} ]] && last_interaction=${last_play}
+  [[ ${last_feed} -gt ${last_interaction} ]] && last_interaction=${last_feed}
+  [[ ${last_interaction} -eq 0 ]] && last_interaction=${now}
+
+  local mins_idle=$(( (now - last_interaction) / 60 ))
+  mood=$(( 100 - mins_idle / 30 ))
+  [[ ${mood} -lt 0 ]] && mood=0
+  [[ ${mood} -gt 100 ]] && mood=100
+
+  # Hunger increases 1 point per 20 minutes since last feed
+  local mins_hungry=$(( (now - last_feed) / 60 ))
+  [[ ${last_feed} -eq 0 ]] && mins_hungry=0
+  hunger=$(( mins_hungry / 20 ))
+  [[ ${hunger} -gt 100 ]] && hunger=100
+
+  echo "${mood}:${hunger}"
+}
+
+mood_emoji() {
+  local mood=$1
+  if [[ ${mood} -ge 80 ]]; then echo "thriving"
+  elif [[ ${mood} -ge 60 ]]; then echo "happy"
+  elif [[ ${mood} -ge 40 ]]; then echo "okay"
+  elif [[ ${mood} -ge 20 ]]; then echo "lonely"
+  else echo "sad"
+  fi
+}
+
+hunger_label() {
+  local hunger=$1
+  if [[ ${hunger} -le 10 ]]; then echo "full"
+  elif [[ ${hunger} -le 30 ]]; then echo "satisfied"
+  elif [[ ${hunger} -le 60 ]]; then echo "hungry"
+  elif [[ ${hunger} -le 80 ]]; then echo "very hungry"
+  else echo "starving"
+  fi
+}
+
+# --- Progress bar ---
+
+progress_bar() {
+  local value=$1
+  local max=${2:-100}
+  local width=${3:-20}
+  local filled=$(( value * width / max ))
+  local empty=$(( width - filled ))
+  local bar=""
+  for (( i=0; i<filled; i++ )); do bar+="="; done
+  for (( i=0; i<empty; i++ )); do bar+="-"; done
+  echo "[${bar}] ${value}/${max}"
+}
+
+# --- Roll a companion from seed ---
+
+roll_companion() {
+  local seed="$1"
+  seed_prng "${seed}-friend-2026"
+
+  local rarity species eye hat shiny
+  roll_rarity
+  rarity=${RARITY_RESULT}
+  prng_pick SPECIES
+  species=${PRNG_PICK_RESULT}
+  prng_pick EYES
+  eye=${PRNG_PICK_RESULT}
+  if [[ "${rarity}" == "common" ]]; then
+    hat="none"
+  else
+    prng_pick HATS
+    hat=${PRNG_PICK_RESULT}
+  fi
+  local shiny_roll
+  prng_range 100
+  shiny_roll=${PRNG_RESULT}
+  if [[ ${shiny_roll} -lt 1 ]]; then
+    shiny="true"
+  else
+    shiny="false"
+  fi
+
+  echo "rarity=${rarity}"
+  echo "species=${species}"
+  echo "eye=${eye}"
+  echo "hat=${hat}"
+  echo "shiny=${shiny}"
+
+  # Roll stats
+  seed_prng "${seed}-friend-2026-stats"
+  roll_stats "${rarity}"
+}
+
+# --- Commands ---
+
+cmd_hatch() {
+  if state_exists; then
+    local name
+    name=$(read_state "name")
+    warn "You already have a companion: ${name}"
+    warn "Use 'fli reroll' to start over."
+    return 1
+  fi
+
+  local seed
+  seed=$(whoami)
+
+  # Check for --seed flag
+  for arg in "$@"; do
+    case "${arg}" in
+      --seed=*) seed="${arg#--seed=}" ;;
+    esac
+  done
+
+  info "Rolling companion for ${CYAN}${seed}${NC}..."
+  echo ""
+
+  local roll_output
+  roll_output=$(roll_companion "${seed}")
+
+  ensure_home
+
+  # Parse roll output and write state
+  local rarity species eye hat shiny
+  while IFS='=' read -r key value; do
+    write_state "${key}" "${value}"
+    case "${key}" in
+      rarity) rarity="${value}" ;;
+      species) species="${value}" ;;
+      eye) eye="${value}" ;;
+      hat) hat="${value}" ;;
+      shiny) shiny="${value}" ;;
+    esac
+  done <<< "${roll_output}"
+
+  write_state "seed" "${seed}"
+  write_state "hatched_at" "$(now_epoch)"
+  write_state "last_feed" "$(now_epoch)"
+  write_state "last_pet" "$(now_epoch)"
+  write_state "last_play" "$(now_epoch)"
+  write_state "xp" "0"
+  write_state "level" "1"
+
+  # Generate a name
+  local names=(Pixel Byte Nibble Chip Spark Glitch Widget Patch Kernel Socket Flux Dash Pip Dot Loop)
+  seed_prng "${seed}-name-2026"
+  local pet_name
+  prng_pick names
+  pet_name=${PRNG_PICK_RESULT}
+  write_state "name" "${pet_name}"
+
+  local color="${RARITY_COLOR_CODE[$rarity]}"
+  local stars="${RARITY_STARS[$rarity]}"
+
+  echo -e "  ${color}${stars} ${rarity^^} ${stars}${NC}"
+  echo ""
+  render_sprite "${species}" "${eye}" "${hat}" 0
+  echo ""
+  echo -e "  ${BOLD}${pet_name}${NC} the ${color}${species}${NC}"
+  [[ "${shiny}" == "true" ]] && echo -e "  ${YELLOW}~ SHINY ~${NC}"
+  echo ""
+  ok "Your companion has hatched! Try: fli status, fli feed, fli pet"
+}
+
+cmd_preview() {
+  local seed="${1:-}"
+  if [[ -z "${seed}" ]]; then
+    err "Usage: fli preview <seed>"
+    echo "  Preview what a seed rolls without hatching."
+    return 1
+  fi
+
+  info "Previewing seed: ${CYAN}${seed}${NC}"
+  echo ""
+
+  local roll_output
+  roll_output=$(roll_companion "${seed}")
+
+  local rarity species eye hat shiny
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      rarity) rarity="${value}" ;;
+      species) species="${value}" ;;
+      eye) eye="${value}" ;;
+      hat) hat="${value}" ;;
+      shiny) shiny="${value}" ;;
+    esac
+  done <<< "${roll_output}"
+
+  # Generate name preview
+  local names=(Pixel Byte Nibble Chip Spark Glitch Widget Patch Kernel Socket Flux Dash Pip Dot Loop)
+  seed_prng "${seed}-name-2026"
+  local pet_name
+  prng_pick names
+  pet_name=${PRNG_PICK_RESULT}
+
+  local color="${RARITY_COLOR_CODE[$rarity]}"
+  local stars="${RARITY_STARS[$rarity]}"
+
+  echo -e "  ${color}${stars} ${rarity^^} ${stars}${NC}"
+  echo ""
+  render_sprite "${species}" "${eye}" "${hat}" 0
+  echo ""
+  echo -e "  ${BOLD}${pet_name}${NC} the ${color}${species}${NC}"
+  [[ "${shiny}" == "true" ]] && echo -e "  ${YELLOW}~ SHINY ~${NC}"
+  echo ""
+
+  # Show stats preview
+  echo -e "  ${DIM}--- Stats ---${NC}"
+  local stat_lines
+  stat_lines=$(echo "${roll_output}" | grep -E "^(DEBUGGING|PATIENCE|CHAOS|WISDOM|SNARK)=")
+  while IFS='=' read -r stat val; do
+    printf "  %-10s %s\n" "${stat}:" "$(progress_bar ${val})"
+  done <<< "${stat_lines}"
+  echo ""
+  info "To hatch with this seed: ${CYAN}fli hatch --seed=${seed}${NC}"
+}
+
+require_companion() {
+  if ! state_exists; then
+    err "No companion found. Run: fli hatch"
+    exit 1
+  fi
+}
+
+cmd_status() {
+  require_companion
+
+  local name species eye hat rarity shiny level xp
+  name=$(read_state "name")
+  species=$(read_state "species")
+  eye=$(read_state "eye")
+  hat=$(read_state "hat")
+  rarity=$(read_state "rarity")
+  shiny=$(read_state "shiny")
+  level=$(read_state "level")
+  xp=$(read_state "xp")
+  [[ -z "${level}" ]] && level=1
+  [[ -z "${xp}" ]] && xp=0
+
+  local color="${RARITY_COLOR_CODE[$rarity]}"
+  local stars="${RARITY_STARS[$rarity]}"
+
+  local mood_hunger
+  mood_hunger=$(compute_mood)
+  local mood=${mood_hunger%%:*}
+  local hunger=${mood_hunger##*:}
+
+  echo ""
+  echo -e "  ${color}${stars} ${rarity^^} ${stars}${NC}"
+  echo ""
+  render_sprite "${species}" "${eye}" "${hat}" 0
+  echo ""
+  echo -e "  ${BOLD}${name}${NC} the ${color}${species}${NC}  (Lv.${level})"
+  [[ "${shiny}" == "true" ]] && echo -e "  ${YELLOW}~ SHINY ~${NC}"
+  echo ""
+  echo -e "  ${DIM}Mood:${NC}      $(progress_bar ${mood}) $(mood_emoji ${mood})"
+  echo -e "  ${DIM}Hunger:${NC}    $(progress_bar $(( 100 - hunger ))) $(hunger_label ${hunger})"
+  echo -e "  ${DIM}XP:${NC}        ${xp} / $(( level * 100 ))"
+  echo ""
+
+  # Stats
+  echo -e "  ${DIM}--- Stats ---${NC}"
+  for stat in "${STAT_NAMES[@]}"; do
+    local val
+    val=$(read_state "${stat}")
+    [[ -z "${val}" ]] && val=0
+    printf "  %-10s %s\n" "${stat}:" "$(progress_bar ${val})"
+  done
+  echo ""
+}
+
+cmd_feed() {
+  require_companion
+  local name species eye hat
+  name=$(read_state "name")
+  species=$(read_state "species")
+  eye=$(read_state "eye")
+  hat=$(read_state "hat")
+
+  write_state "last_feed" "$(now_epoch)"
+
+  # Gain XP
+  local xp level
+  xp=$(read_state "xp")
+  level=$(read_state "level")
+  [[ -z "${xp}" ]] && xp=0
+  [[ -z "${level}" ]] && level=1
+  xp=$(( xp + 10 ))
+  local needed=$(( level * 100 ))
+  if [[ ${xp} -ge ${needed} ]]; then
+    xp=$(( xp - needed ))
+    level=$(( level + 1 ))
+    write_state "level" "${level}"
+    echo ""
+    ok "${name} leveled up to Lv.${level}!"
+  fi
+  write_state "xp" "${xp}"
+
+  echo ""
+  local foods=("a mass of spaghetti" "a mass of cookies" "some fish" "a mass of berries" "a mass of pizza" "some tacos")
+  seed_prng "$(now_epoch)"
+  local food
+  prng_pick foods
+  food=${PRNG_PICK_RESULT}
+  render_sprite "${species}" "${eye}" "${hat}" 1
+  echo ""
+  echo -e "  ${name} munches on ${food}..."
+  echo -e "  ${GREEN}nom nom nom${NC}"
+  echo ""
+}
+
+cmd_pet() {
+  require_companion
+  local name species eye hat rarity
+  name=$(read_state "name")
+  species=$(read_state "species")
+  eye=$(read_state "eye")
+  hat=$(read_state "hat")
+  rarity=$(read_state "rarity")
+
+  write_state "last_pet" "$(now_epoch)"
+
+  local xp level
+  xp=$(read_state "xp")
+  level=$(read_state "level")
+  [[ -z "${xp}" ]] && xp=0
+  [[ -z "${level}" ]] && level=1
+  xp=$(( xp + 5 ))
+  local needed=$(( level * 100 ))
+  if [[ ${xp} -ge ${needed} ]]; then
+    xp=$(( xp - needed ))
+    level=$(( level + 1 ))
+    write_state "level" "${level}"
+    echo ""
+    ok "${name} leveled up to Lv.${level}!"
+  fi
+  write_state "xp" "${xp}"
+
+  local color="${RARITY_COLOR_CODE[$rarity]}"
+  echo ""
+  # Show hearts
+  for frame in "${PET_FRAMES[@]}"; do
+    echo -e "  ${RED}${frame}${NC}"
+  done
+  render_sprite "${species}" "${eye}" "${hat}" 0
+  echo ""
+  echo -e "  ${name} purrs contentedly... ${RED}<3${NC}"
+  echo ""
+}
+
+cmd_play() {
+  require_companion
+  local name species eye hat
+  name=$(read_state "name")
+  species=$(read_state "species")
+  eye=$(read_state "eye")
+  hat=$(read_state "hat")
+
+  write_state "last_play" "$(now_epoch)"
+
+  local xp level
+  xp=$(read_state "xp")
+  level=$(read_state "level")
+  [[ -z "${xp}" ]] && xp=0
+  [[ -z "${level}" ]] && level=1
+  xp=$(( xp + 15 ))
+  local needed=$(( level * 100 ))
+  if [[ ${xp} -ge ${needed} ]]; then
+    xp=$(( xp - needed ))
+    level=$(( level + 1 ))
+    write_state "level" "${level}"
+    echo ""
+    ok "${name} leveled up to Lv.${level}!"
+  fi
+  write_state "xp" "${xp}"
+
+  echo ""
+  local games=("fetch" "hide and seek" "tag" "riddles" "code review" "pair programming" "rubber duck debugging")
+  seed_prng "$(now_epoch)"
+  local game
+  prng_pick games
+  game=${PRNG_PICK_RESULT}
+
+  # Show animation frames
+  for f in 0 1 2 1 0; do
+    render_sprite "${species}" "${eye}" "${hat}" "${f}"
+    echo ""
+    sleep 0.3
+    # Move cursor up to overwrite (5 lines of sprite + 1 blank)
+    printf '\033[6A'
+  done
+  render_sprite "${species}" "${eye}" "${hat}" 0
+  echo ""
+  echo -e "  ${name} played ${CYAN}${game}${NC}!"
+  echo -e "  ${GREEN}+15 XP${NC}"
+  echo ""
+}
+
+cmd_train() {
+  require_companion
+  local stat="${1:-}"
+  stat=$(echo "${stat}" | tr '[:lower:]' '[:upper:]')
+
+  if [[ -z "${stat}" ]]; then
+    err "Usage: fli train <stat>"
+    echo "  Available stats: ${STAT_NAMES[*]}"
+    return 1
+  fi
+
+  local valid=false
+  for s in "${STAT_NAMES[@]}"; do
+    [[ "${s}" == "${stat}" ]] && valid=true
+  done
+  if [[ "${valid}" != "true" ]]; then
+    err "Unknown stat: ${stat}"
+    echo "  Available stats: ${STAT_NAMES[*]}"
+    return 1
+  fi
+
+  local name val
+  name=$(read_state "name")
+  val=$(read_state "${stat}")
+  [[ -z "${val}" ]] && val=0
+
+  local gain=$(( RANDOM % 3 + 1 ))
+  val=$(( val + gain ))
+  [[ ${val} -gt 100 ]] && val=100
+  write_state "${stat}" "${val}"
+
+  echo ""
+  echo -e "  ${name} trains ${CYAN}${stat}${NC}... +${gain}!"
+  echo -e "  ${stat}: $(progress_bar ${val})"
+  echo ""
+}
+
+cmd_rename() {
+  require_companion
+  local new_name="${1:-}"
+  if [[ -z "${new_name}" ]]; then
+    err "Usage: fli rename <name>"
+    return 1
+  fi
+  local old_name
+  old_name=$(read_state "name")
+  write_state "name" "${new_name}"
+  ok "${old_name} is now known as ${new_name}!"
+}
+
+cmd_sprite() {
+  require_companion
+  local species eye hat
+  species=$(read_state "species")
+  eye=$(read_state "eye")
+  hat=$(read_state "hat")
+  echo ""
+  render_sprite "${species}" "${eye}" "${hat}" 0
+  echo ""
+}
+
+cmd_animate() {
+  require_companion
+  local species eye hat name rarity level shiny
+  species=$(read_state "species")
+  eye=$(read_state "eye")
+  hat=$(read_state "hat")
+  name=$(read_state "name")
+  rarity=$(read_state "rarity")
+  level=$(read_state "level")
+  shiny=$(read_state "shiny")
+  [[ -z "${level}" ]] && level=1
+  local color="${RARITY_COLOR_CODE[$rarity]}"
+  local stars="${RARITY_STARS[$rarity]}"
+
+  # Compute mood and hunger once at start
+  local mood_hunger mood hunger
+  mood_hunger=$(compute_mood)
+  mood=${mood_hunger%%:*}
+  hunger=${mood_hunger##*:}
+
+  # Thought bubbles based on mood and hunger
+  local -a happy_thoughts=("life is good" "~" "la la la" "coding time" ":)" "<3" "vibes" "flow state")
+  local -a okay_thoughts=("hmm..." "..." "thinking" "*yawn*" "bored" "zzz")
+  local -a sad_thoughts=("..." "lonely..." "hello?" "miss you" "*sigh*" "come back")
+  local -a hungry_thoughts=("so hungry..." "feed me" "nom?" "*rumble*" "snacks?" "starving...")
+
+  # Actions the pet can do
+  local -a happy_actions=("bounces around" "does a little dance" "chases its tail" "hums a tune" "winks" "strikes a pose" "does a spin")
+  local -a okay_actions=("looks around" "stretches" "yawns" "sits quietly" "blinks slowly" "scratches ear")
+  local -a sad_actions=("stares at the ground" "sighs softly" "curls up" "looks at the door" "whimpers")
+
+  # Environment particles
+  local -a env_happy=("  *  .  *  .  *  " " .  *  .  *  .  " "*  .  *  .  *   " "  .  *  .  *  . ")
+  local -a env_sad=("  .     .     .  " "     .     .     " "  .        .     " "        .        ")
+  local -a env_sleep=("                 " "           z     " "          z z    " "         z z z   ")
+  local -a env_shiny=(" + . * . + . * . " " . * . + . * . + " " * . + . * . + . " " . + . * . + . * ")
+
+  # Pick which thought/action pools to use
+  local -a thoughts actions env_particles
+  if [[ ${hunger} -ge 70 ]]; then
+    thoughts=("${hungry_thoughts[@]}")
+    actions=("${sad_actions[@]}")
+    env_particles=("${env_sad[@]}")
+  elif [[ ${mood} -ge 70 ]]; then
+    thoughts=("${happy_thoughts[@]}")
+    actions=("${happy_actions[@]}")
+    if [[ "${shiny}" == "true" ]]; then
+      env_particles=("${env_shiny[@]}")
+    else
+      env_particles=("${env_happy[@]}")
+    fi
+  elif [[ ${mood} -ge 40 ]]; then
+    thoughts=("${okay_thoughts[@]}")
+    actions=("${okay_actions[@]}")
+    env_particles=("${env_happy[@]}")
+  else
+    thoughts=("${sad_thoughts[@]}")
+    actions=("${sad_actions[@]}")
+    env_particles=("${env_sad[@]}")
+  fi
+
+  # Animation state
+  local tick=0
+  local phase="idle"        # idle, thought, action, sleep, env
+  local phase_timer=0
+  local phase_duration=8
+  local thought_text=""
+  local action_text=""
+  local bubble_frame=0
+  local sleep_counter=0
+
+  # Total display height: env(1) + bubble(1) + sprite(5) + name(1) + status(1) + action(1) = 10 lines
+  local DISPLAY_LINES=10
+
+  # Idle frame sequences per mood
+  local -a idle_seq_happy=(0 0 1 0 0 1 0 2 0 0 1 1 0 0 2)
+  local -a idle_seq_okay=(0 0 0 0 1 0 0 0 0 0 0 2 0 0 0)
+  local -a idle_seq_sad=(0 0 0 0 0 0 0 0 1 0 0 0 0 0 0)
+  local -a idle_seq
+  if [[ ${mood} -ge 70 ]]; then
+    idle_seq=("${idle_seq_happy[@]}")
+  elif [[ ${mood} -ge 40 ]]; then
+    idle_seq=("${idle_seq_okay[@]}")
+  else
+    idle_seq=("${idle_seq_sad[@]}")
+  fi
+
+  # Speed based on mood (happy = faster)
+  local sleep_time="0.4"
+  if [[ ${mood} -lt 40 ]]; then
+    sleep_time="0.7"
+  elif [[ ${mood} -lt 70 ]]; then
+    sleep_time="0.5"
+  fi
+
+  # Mini progress bars (10 wide)
+  local mood_bar hunger_bar
+  local mood_filled=$(( mood * 10 / 100 ))
+  local mood_empty=$(( 10 - mood_filled ))
+  mood_bar=""
+  for (( i=0; i<mood_filled; i++ )); do mood_bar+="="; done
+  for (( i=0; i<mood_empty; i++ )); do mood_bar+="-"; done
+  local hunger_filled=$(( (100 - hunger) * 10 / 100 ))
+  local hunger_empty=$(( 10 - hunger_filled ))
+  hunger_bar=""
+  for (( i=0; i<hunger_filled; i++ )); do hunger_bar+="="; done
+  for (( i=0; i<hunger_empty; i++ )); do hunger_bar+="-"; done
+
+  trap 'printf "\033[?25h"; printf "\033[%dB" 2; echo ""; exit 0' INT
+  printf '\033[?25l'  # hide cursor
+
+  # Print initial blank lines to reserve space
+  for (( i=0; i<DISPLAY_LINES; i++ )); do echo ""; done
+  printf "\033[${DISPLAY_LINES}A"
+
+  while true; do
+    # Phase transitions
+    if [[ ${phase_timer} -ge ${phase_duration} ]]; then
+      phase_timer=0
+      local roll=$(( RANDOM % 100 ))
+      if [[ ${mood} -lt 20 && ${roll} -lt 40 ]]; then
+        phase="sleep"
+        phase_duration=$(( 6 + RANDOM % 6 ))
+        sleep_counter=0
+      elif [[ ${roll} -lt 30 ]]; then
+        phase="thought"
+        phase_duration=$(( 4 + RANDOM % 4 ))
+        local tidx=$(( RANDOM % ${#thoughts[@]} ))
+        thought_text="${thoughts[$tidx]}"
+        bubble_frame=0
+      elif [[ ${roll} -lt 55 ]]; then
+        phase="action"
+        phase_duration=$(( 3 + RANDOM % 3 ))
+        local aidx=$(( RANDOM % ${#actions[@]} ))
+        action_text="${actions[$aidx]}"
+      elif [[ ${roll} -lt 75 ]]; then
+        phase="env"
+        phase_duration=$(( 4 + RANDOM % 4 ))
+      else
+        phase="idle"
+        phase_duration=$(( 6 + RANDOM % 10 ))
+      fi
+    fi
+
+    # Determine sprite frame
+    local frame
+    if [[ "${phase}" == "sleep" ]]; then
+      frame=0
+    else
+      local seq_idx=$(( tick % ${#idle_seq[@]} ))
+      frame=${idle_seq[$seq_idx]}
+    fi
+
+    # Line 1: environment particles
+    local env_line="                 "
+    if [[ "${phase}" == "env" || ("${shiny}" == "true" && $(( tick % 3 )) -eq 0) ]]; then
+      local eidx=$(( tick % ${#env_particles[@]} ))
+      env_line="${env_particles[$eidx]}"
+    fi
+    printf "\r  \033[2m%s\033[0m\033[K\n" "${env_line}"
+
+    # Line 2: thought bubble or blank
+    if [[ "${phase}" == "thought" ]]; then
+      local bubble_chars=${#thought_text}
+      if [[ ${bubble_frame} -eq 0 ]]; then
+        printf "\r  \033[2m  o\033[0m\033[K\n"
+      elif [[ ${bubble_frame} -eq 1 ]]; then
+        printf "\r  \033[2m  O\033[0m\033[K\n"
+      else
+        printf "\r  ( %s )\033[K\n" "${thought_text}"
+      fi
+      bubble_frame=$(( bubble_frame + 1 ))
+    elif [[ "${phase}" == "sleep" ]]; then
+      local zidx=$(( sleep_counter % ${#env_sleep[@]} ))
+      printf "\r  \033[2m%s\033[0m\033[K\n" "${env_sleep[$zidx]}"
+      sleep_counter=$(( sleep_counter + 1 ))
+    else
+      printf "\r\033[K\n"
+    fi
+
+    # Lines 3-7: sprite (5 lines)
+    local sprite_output
+    sprite_output=$(render_sprite "${species}" "${eye}" "${hat}" "${frame}")
+    while IFS= read -r line; do
+      printf "\r  %s\033[K\n" "${line}"
+    done <<< "${sprite_output}"
+
+    # Line 8: name and rarity
+    printf "\r  \033[1m%s\033[0m the %b%s%b  (Lv.%s)\033[K\n" "${name}" "${color}" "${species}" "${NC}" "${level}"
+
+    # Line 9: status bar
+    printf "\r  \033[2mMood[%s] Hunger[%s]\033[0m\033[K\n" "${mood_bar}" "${hunger_bar}"
+
+    # Line 10: action text or blank
+    if [[ "${phase}" == "action" ]]; then
+      printf "\r  \033[3m%s %s\033[0m\033[K\n" "${name}" "${action_text}"
+    elif [[ "${phase}" == "sleep" ]]; then
+      printf "\r  \033[2m%s is sleeping...\033[0m\033[K\n" "${name}"
+    else
+      printf "\r\033[K\n"
+    fi
+
+    sleep "${sleep_time}"
+    printf "\033[${DISPLAY_LINES}A"
+    tick=$(( tick + 1 ))
+    phase_timer=$(( phase_timer + 1 ))
+  done
+}
+
+cmd_advice() {
+  require_companion
+  local name species eye hat rarity
+  name=$(read_state "name")
+  species=$(read_state "species")
+  eye=$(read_state "eye")
+  hat=$(read_state "hat")
+  rarity=$(read_state "rarity")
+
+  # Read all stats
+  local -A stats
+  local highest_stat="" highest_val=0
+  for stat in "${STAT_NAMES[@]}"; do
+    local val
+    val=$(read_state "${stat}")
+    [[ -z "${val}" ]] && val=0
+    stats[${stat}]=${val}
+    if [[ ${val} -gt ${highest_val} ]]; then
+      highest_val=${val}
+      highest_stat=${stat}
+    fi
+  done
+
+  # Pick pool based on stats with weighted randomness
+  # 60% chance highest stat pool, 25% second highest, 15% random
+  local roll=$(( RANDOM % 100 ))
+  local pool_stat="${highest_stat}"
+
+  if [[ ${roll} -ge 60 ]]; then
+    # Sort stats to find second highest or pick random
+    local -a sorted_stats=()
+    for stat in "${STAT_NAMES[@]}"; do
+      sorted_stats+=("${stats[${stat}]}:${stat}")
+    done
+    IFS=$'\n' sorted_stats=($(sort -t: -k1 -rn <<< "${sorted_stats[*]}")); unset IFS
+
+    if [[ ${roll} -ge 85 ]]; then
+      # Random pool
+      local ridx=$(( RANDOM % ${#STAT_NAMES[@]} ))
+      pool_stat="${STAT_NAMES[$ridx]}"
+    else
+      # Second highest
+      pool_stat="${sorted_stats[1]#*:}"
+    fi
+  fi
+
+  # Select advice from the chosen pool
+  local -n pool="ADVICE_${pool_stat}"
+  local idx=$(( RANDOM % ${#pool[@]} ))
+  local advice="${pool[$idx]}"
+
+  # SNARK modifier: if SNARK is high enough, chance to wrap the advice
+  local snark_val=${stats[SNARK]}
+  local snark_roll=$(( RANDOM % 100 ))
+  local snark_prefix="" snark_suffix=""
+  if [[ ${snark_val} -ge 50 && ${snark_roll} -lt $(( snark_val / 2 )) && "${pool_stat}" != "SNARK" ]]; then
+    local -a prefixes=(
+      "Look, I'm not saying you need this, but..."
+      "Not to be rude, but..."
+      "You probably already know this, but..."
+      "Don't shoot the messenger:"
+      "Friendly reminder:"
+      "Hot take:"
+      "Unpopular opinion:"
+      "Since you asked (you didn't):"
+      "Free advice (worth what you paid):"
+      "Your pet stares at you and says:"
+    )
+    local pidx=$(( RANDOM % ${#prefixes[@]} ))
+    snark_prefix="${prefixes[$pidx]} "
+  fi
+
+  # Gain XP for seeking wisdom
+  local xp level
+  xp=$(read_state "xp")
+  level=$(read_state "level")
+  [[ -z "${xp}" ]] && xp=0
+  [[ -z "${level}" ]] && level=1
+  xp=$(( xp + 3 ))
+  local needed=$(( level * 100 ))
+  if [[ ${xp} -ge ${needed} ]]; then
+    xp=$(( xp - needed ))
+    level=$(( level + 1 ))
+    write_state "level" "${level}"
+    echo ""
+    ok "${name} leveled up to Lv.${level}!"
+  fi
+  write_state "xp" "${xp}"
+
+  local color="${RARITY_COLOR_CODE[$rarity]}"
+  local face
+  face=$(render_face "${species}" "${eye}")
+
+  echo ""
+  echo -e "  ${color}${face}${NC}  ${DIM}${pool_stat} advice:${NC}"
+  echo ""
+  echo -e "  ${snark_prefix}${BOLD}${advice}${NC}"
+  echo ""
+}
+
+cmd_card() {
+  require_companion
+
+  local name species eye hat rarity shiny level xp
+  name=$(read_state "name")
+  species=$(read_state "species")
+  eye=$(read_state "eye")
+  hat=$(read_state "hat")
+  rarity=$(read_state "rarity")
+  shiny=$(read_state "shiny")
+  level=$(read_state "level")
+  xp=$(read_state "xp")
+  [[ -z "${level}" ]] && level=1
+  [[ -z "${xp}" ]] && xp=0
+
+  local color="${RARITY_COLOR_CODE[$rarity]}"
+  local stars="${RARITY_STARS[$rarity]}"
+
+  echo ""
+  echo -e "  ${color}+================================+${NC}"
+  echo -e "  ${color}|${NC}  ${stars} ${rarity^^} ${stars}"
+  echo -e "  ${color}|${NC}"
+
+  # Render sprite inline in card
+  local sprite_output
+  sprite_output=$(render_sprite "${species}" "${eye}" "${hat}" 0)
+  while IFS= read -r line; do
+    echo -e "  ${color}|${NC} ${line}"
+  done <<< "${sprite_output}"
+
+  echo -e "  ${color}|${NC}"
+  echo -e "  ${color}|${NC}  ${BOLD}${name}${NC} the ${species}"
+  echo -e "  ${color}|${NC}  Level ${level}  (${xp} XP)"
+  [[ "${shiny}" == "true" ]] && echo -e "  ${color}|${NC}  ${YELLOW}~ SHINY ~${NC}"
+  echo -e "  ${color}|${NC}"
+
+  for stat in "${STAT_NAMES[@]}"; do
+    local val
+    val=$(read_state "${stat}")
+    [[ -z "${val}" ]] && val=0
+    printf "  ${color}|${NC}  %-10s %s\n" "${stat}" "$(progress_bar ${val} 100 15)"
+  done
+
+  echo -e "  ${color}|${NC}"
+  echo -e "  ${color}+================================+${NC}"
+  echo ""
+}
+
+cmd_reroll() {
+  if state_exists; then
+    local name
+    name=$(read_state "name")
+    echo ""
+    warn "This will reset ${name} forever."
+    read -rp "  Are you sure? [y/N] " confirm
+    if [[ "${confirm}" != "y" && "${confirm}" != "Y" ]]; then
+      info "Aborted."
+      return
+    fi
+    rm -f "${FRIEND_STATE}"
+    ok "Companion reset. Run: fli hatch"
+  else
+    info "No companion to reset."
+  fi
+}
+
+cmd_version() {
+  echo ""
+  echo -e "  ${CYAN}+--++-+-+-=-+=-+=-+-=-+-+-+--+${NC}"
+  echo -e "  ${CYAN}| F R I E N D - L I           |${NC}"
+  echo -e "  ${CYAN}+--++-+-+-=-+=-+=-+-=-+-+-+--+${NC}"
+  echo -e "  ${GREEN}CLI pet tamagotchi${NC}"
+  echo -e "  ${DIM}v1.2.0${NC}"
+  echo ""
+}
+
+cmd_help() {
+  cmd_version
+  cat <<'HELP'
+  Usage: fli <command> [args]
+
+  Commands:
+    hatch           Hatch your companion (first time)
+    hatch --seed=X  Hatch with a custom seed
+    preview <seed>  Preview a seed roll without hatching
+    status          Show detailed stats, mood, and hunger
+    feed            Feed your pet
+    pet             Pet your companion
+    play            Play with your pet (animated!)
+    train <stat>    Train a stat (DEBUGGING, PATIENCE, CHAOS, WISDOM, SNARK)
+    advice          Get dev advice from your pet (stat-weighted)
+    rename <name>   Rename your companion
+    sprite          Show the ASCII sprite
+    animate         Watch idle animation loop (Ctrl+C to stop)
+    card            Show the companion card
+    reroll          Reroll your companion (resets everything)
+    version         Show version
+    help            Show this help
+
+HELP
+}
+
+# --- Main dispatch ---
+
+main() {
+  local cmd="${1:-}"
+  shift 2>/dev/null || true
+
+  case "${cmd}" in
+    hatch)    cmd_hatch "$@" ;;
+    preview)  cmd_preview "$@" ;;
+    status|"")
+      if state_exists; then
+        cmd_status
+      else
+        cmd_help
+        echo ""
+        info "No companion yet. Run: ${CYAN}fli hatch${NC}"
+      fi
+      ;;
+    feed)     cmd_feed ;;
+    pet)      cmd_pet ;;
+    play)     cmd_play ;;
+    train)    cmd_train "$@" ;;
+    rename)   cmd_rename "$@" ;;
+    sprite)   cmd_sprite ;;
+    animate)  cmd_animate ;;
+    card)     cmd_card ;;
+    advice)   cmd_advice ;;
+    reroll)   cmd_reroll ;;
+    version)  cmd_version ;;
+    help|-h|--help) cmd_help ;;
+    *)
+      err "Unknown command: ${cmd}"
+      cmd_help
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"
